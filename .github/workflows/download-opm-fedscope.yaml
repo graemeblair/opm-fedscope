@@ -1,0 +1,186 @@
+name: "Download latest OPM workforce data (FedScope)"
+
+on:
+  schedule:
+    - cron: '0 13 * * 1-5' # 08:00 ET (Mon-Fri)
+    - cron: '0 17 * * 1-5' # 12:00 ET (Mon-Fri)
+    - cron: '0 23 * * 1-5' # 18:00 ET (Mon-Fri)
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+
+  check:
+    runs-on: ubuntu-latest
+    outputs:
+      new_data: ${{ steps.check.outputs.new_data }}
+
+    steps:
+      - uses: actions/checkout@v4
+        # No LFS needed — we only inspect filenames, not file contents
+
+      - name: Check for new OPM data
+        id: check
+        run: |
+          types="accessions separations employment"
+          current_yyyymm=$(date +%Y%m)
+          new_data=false
+
+          for type in $types; do
+            for year in $(seq 2021 $(date +%Y)); do
+              for month in $(seq 1 12); do
+                yyyymm=$(printf "%d%02d" $year $month)
+                [ "$yyyymm" -gt "$current_yyyymm" ] && continue
+                out="slices/${type}-${yyyymm}.parquet"
+                if [ ! -f "$out" ]; then
+                  url="https://data.opm.gov/api/blob/download/chunked/${type}_${yyyymm}_1.txt"
+                  status=$(curl -s -o /dev/null -w "%{http_code}" -r "0-0" "$url")
+                  if [ "$status" = "200" ] || [ "$status" = "206" ]; then
+                    echo "New data available: $type $yyyymm"
+                    new_data=true
+                    break 3
+                  fi
+                fi
+              done
+            done
+          done
+
+          echo "new_data=$new_data" >> $GITHUB_OUTPUT
+
+  download:
+    needs: check
+    if: needs.check.outputs.new_data == 'true'
+    runs-on: large-runner
+    outputs:
+      pr_url: ${{ steps.create_pr.outputs.pr_url }}
+      pr_branch: ${{ steps.check_new.outputs.pr_branch }}
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          lfs: true
+
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y libcurl4-openssl-dev
+
+      - uses: r-lib/actions/setup-r@v2
+
+      - uses: r-lib/actions/setup-renv@v2
+        with:
+          cache-version: 1
+
+      - name: Download new OPM FedScope data
+        run: |
+          mkdir -p slices data
+          Rscript code/download.R
+
+      - name: Check for new data files
+        id: check_new
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          branch="opm-fedscope-update-$(date +%Y-%m-%d-%H%M)"
+          git checkout -b "$branch"
+          echo "pr_branch=$branch" >> $GITHUB_OUTPUT
+          git add slices/
+
+          if git diff --cached --quiet; then
+            echo "new_data=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          new_files=$(git diff --cached --name-only | grep "^slices/")
+
+          # Check if any open PR already contains these files
+          open_prs=$(gh pr list --state open --json number --jq '.[].number')
+          for pr in $open_prs; do
+            pr_files=$(gh pr view "$pr" --json files --jq '.files[].path')
+            for file in $new_files; do
+              if echo "$pr_files" | grep -qF "$file"; then
+                echo "File '$file' already present in open PR #$pr — skipping."
+                echo "new_data=false" >> $GITHUB_OUTPUT
+                exit 0
+              fi
+            done
+          done
+
+          echo "new_data=true" >> $GITHUB_OUTPUT
+          echo "$new_files" > /tmp/new_opm_files.txt
+
+      - name: Rebuild stacked parquet
+        if: steps.check_new.outputs.new_data == 'true'
+        run: Rscript code/stack.R
+
+      - name: Rebuild counts
+        if: steps.check_new.outputs.new_data == 'true'
+        run: Rscript code/counts.R
+
+      - name: Commit and push
+        if: steps.check_new.outputs.new_data == 'true'
+        run: |
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action"
+          git add slices/ data/
+          git commit -m "Add new OPM FedScope data [skip ci]"
+          git pull --rebase origin main
+          git push --set-upstream origin HEAD
+
+      - name: Create pull request
+        id: create_pr
+        if: steps.check_new.outputs.new_data == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          new_files=$(cat /tmp/new_opm_files.txt)
+          file_count=$(echo "$new_files" | wc -l | tr -d ' ')
+          pr_url=$(gh pr create \
+            --title "New OPM FedScope data — $(date +%Y-%m-%d) ($file_count new file(s))" \
+            --body "$(printf 'Automated update: new OPM FedScope workforce files detected.\n\n**New files:**\n%s' "$(echo "$new_files" | sed 's/^/- /')")" \
+            --reviewer graemeblair \
+            --base main)
+          echo "pr_url=$pr_url" >> $GITHUB_OUTPUT
+
+  validate:
+    needs: download
+    if: needs.download.result == 'success' && needs.download.outputs.pr_url != ''
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.download.outputs.pr_branch }}
+          lfs: true
+
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y libcurl4-openssl-dev
+
+      - uses: r-lib/actions/setup-r@v2
+
+      - uses: r-lib/actions/setup-renv@v2
+        with:
+          cache-version: 1
+
+      - name: Run pointblank checks
+        env:
+          CHECK_SUMMARY_PATH: /tmp/check-summary.md
+        run: Rscript code/check.R || true
+
+      - name: Comment results on PR
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh pr comment "${{ needs.download.outputs.pr_url }}" \
+            --body-file /tmp/check-summary.md
+
+  rerun-on-failure:
+    needs: download
+    if: failure() && fromJSON(github.run_attempt) < 3
+    runs-on: ubuntu-latest
+    steps:
+      - env:
+          GH_REPO: ${{ github.repository }}
+          GH_TOKEN: ${{ github.token }}
+        run: gh run rerun ${{ github.run_id }} --failed
