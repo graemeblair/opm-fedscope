@@ -6,6 +6,8 @@ library(httr2)
 library(arrow)
 library(glue)
 
+source("code/schemas.R")
+
 # ---- Configuration ----
 
 DATA_TYPES <- c("accessions", "separations", "employment")
@@ -79,13 +81,38 @@ crossing(
       return(invisible(NULL))
     }
 
-    read_delim(
-      tmp,
-      delim = "|",
-      col_types = cols(.default = "c"),
-      show_col_types = FALSE
-    ) |>
-      write_parquet(out_path(type, year, month), compression = "ZSTD")
+    raw <-
+      read_delim(
+        tmp,
+        delim = "|",
+        col_types = cols(.default = "c"),
+        show_col_types = FALSE
+      )
+
+    # Apply target schema: NA-clean numeric cols, Y/N → logical for bools,
+    # then cast to int/float/bool/dictionary types defined in schemas.R.
+    present <- names(raw)
+    for (col in intersect(c(INT_COLS, FLOAT_COLS), present)) {
+      raw[[col]] <- ifelse(raw[[col]] %in% NA_STRINGS, NA_character_, raw[[col]])
+    }
+    for (col in intersect(BOOL_COLS, present)) {
+      raw[[col]] <- dplyr::case_when(
+        raw[[col]] == "Y" ~ TRUE,
+        raw[[col]] == "N" ~ FALSE,
+        TRUE ~ NA
+      )
+    }
+
+    target <- slice_schema(type)
+    keep <- intersect(target$names, present)
+    tbl <- arrow::as_arrow_table(raw[, keep, drop = FALSE])
+    cast_fields <- lapply(tbl$schema$names, function(n) target$GetFieldByName(n))
+    cast_schema <- do.call(arrow::schema, cast_fields)
+    tbl <- tbl$cast(cast_schema)
+
+    write_parquet(tbl, out_path(type, year, month),
+      compression = "zstd", compression_level = 15L, use_dictionary = TRUE
+    )
 
     unlink(tmp)
   })
